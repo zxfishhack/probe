@@ -16,9 +16,9 @@ var (
 	multicastIP = net.ParseIP("224.0.0.1")
 )
 
-type Listener interface {
-	Serve() error
-	Stop()
+type connector struct {
+	*net.UDPConn
+	ifi net.Interface
 }
 
 type Result struct {
@@ -26,111 +26,62 @@ type Result struct {
 	IP string
 }
 
-type pkg struct {
-	msg  message
-	addr net.Addr
-}
-
-type Prober struct {
+type Listener struct {
 	id     string
-	conn   []*net.UDPConn
+	conn   []*connector
 	addr   *net.UDPAddr
 	g      *errgroup.Group
 	ctx    context.Context
-	cancel func()
-	msg    chan *pkg
 	result chan Result
 }
 
-func (l *Prober) readLoop(conn *net.UDPConn) (err error) {
+func (l *Listener) readLoop(conn *connector) (err error) {
+	var n int
 	for {
-		buf := make([]byte, 1500)
-		p := &pkg{}
-		_, p.addr, err = conn.ReadFrom(buf)
+		buf := make([]byte, conn.ifi.MTU)
+		var msg message
+		n, _, err = conn.ReadFrom(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				err = nil
+			}
+			if err != nil {
+				log.Printf("ReadFrom %s failed %s", conn.ifi.Name, err.Error())
+			}
 			return
 		}
-		log.Print(string(buf))
-		err = json.Unmarshal(buf, &p.msg)
-		if err == nil {
-			l.msg <- p
+		err = json.Unmarshal(buf[:n], &msg)
+		if err == nil && msg.verify() == nil {
+			msg.ID = l.id
+			msg.signature()
+			buf, err = json.Marshal(msg)
+			_, err = conn.WriteTo(buf, l.addr)
 		}
 	}
 }
 
-func (l *Prober) startRead() {
+func (l *Listener) Serve() (err error) {
 	for _, conn := range l.conn {
-		l.g.Go(func() error {
-			return l.readLoop(conn)
-		})
+		func(c *connector) {
+			l.g.Go(func() error {
+				return l.readLoop(c)
+			})
+		}(conn)
+		// l.g.Go(func() error { return l.readLoop(conn) })
 	}
+	return l.g.Wait()
 }
 
-func (l *Prober) stopRead() {
+func (l *Listener) Stop() {
 	for _, conn := range l.conn {
 		_ = conn.Close()
 	}
 }
 
-func (l *Prober) mainLoop() (err error) {
-	defer l.stopRead()
-	for {
-		select {
-		case <-l.ctx.Done():
-			err = l.ctx.Err()
-			if errors.Is(err, context.Canceled) {
-				err = nil
-			}
-			return
-		case m := <-l.msg:
-			log.Printf("%#v", m)
-		}
-	}
-}
-
-func (l *Prober) probeLoop() (err error) {
-	defer l.stopRead()
-	timer := time.NewTimer(time.Second)
-	for {
-		select {
-		case <-l.ctx.Done():
-			err = l.ctx.Err()
-			if errors.Is(err, context.Canceled) {
-				err = nil
-			}
-			return
-		case m := <-l.msg:
-			log.Printf("%#v", m)
-		case <-timer.C:
-			for _, conn := range l.conn {
-				_, e := conn.WriteTo([]byte("xxx"), l.addr)
-				log.Print(e, *l.addr)
-			}
-			timer.Reset(30 * time.Second)
-		}
-	}
-}
-
-func (l *Prober) probe() {
-	l.result = make(chan Result, 10)
-	l.startRead()
-	l.g.Go(l.probeLoop)
-}
-
-func (l *Prober) Serve() (err error) {
-	l.startRead()
-	l.g.Go(l.mainLoop)
-	return l.g.Wait()
-}
-
-func (l *Prober) Stop() {
-	l.cancel()
-}
-
-func newProber(ctx context.Context, id string) (o *Prober, err error) {
-	o = &Prober{
+func NewListener(ctx context.Context, id string) (l *Listener, err error) {
+	o := &Listener{
 		id:   id,
-		msg:  make(chan *pkg, 10),
+		ctx:  ctx,
 		addr: &net.UDPAddr{IP: multicastIP, Port: Port},
 	}
 	ifs, err := net.Interfaces()
@@ -144,31 +95,139 @@ func newProber(ctx context.Context, id string) (o *Prober, err error) {
 		}
 		c, err = net.ListenMulticastUDP("udp4", &ifi, o.addr)
 		if err != nil {
+			err = nil
 			continue
 		}
-		log.Printf("start prober @ %s", ifi.Name)
-		o.conn = append(o.conn, c)
+		log.Printf("start listener @ %s", ifi.Name)
+		o.conn = append(o.conn, &connector{
+			UDPConn: c,
+			ifi:     ifi,
+		})
 	}
 	if err != nil {
 		return
 	}
-	o.ctx, o.cancel = context.WithCancel(ctx)
 	o.g, o.ctx = errgroup.WithContext(o.ctx)
-
+	l = o
 	return
 }
 
-func NewListener(ctx context.Context, id string) (l Listener, err error) {
-	l, err = newProber(ctx, id)
+type prober struct {
+	id     string
+	conn   []*connector
+	addr   *net.UDPAddr
+	g      *errgroup.Group
+	ctx    context.Context
+	result chan Result
+}
+
+func (p *prober) readLoop(conn *connector) (err error) {
+	var n int
+	for {
+		buf := make([]byte, 1500)
+		var addr net.Addr
+		var msg message
+		n, addr, err = conn.ReadFrom(buf)
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				err = nil
+			}
+			if err != nil {
+				log.Printf("ReadFrom %s failed %s", conn.ifi.Name, err.Error())
+			}
+			return
+		}
+		err = json.Unmarshal(buf[:n], &msg)
+		if err == nil && msg.verify() == nil {
+			p.result <- Result{
+				ID: msg.ID,
+				IP: addr.(*net.UDPAddr).IP.String(),
+			}
+		}
+	}
+}
+
+func (p *prober) stopRead() {
+	for _, conn := range p.conn {
+		_ = conn.Close()
+	}
+}
+
+func (p *prober) probeLoop() {
+	defer close(p.result)
+	defer p.g.Wait()
+	defer p.stopRead()
+	timer := time.NewTimer(time.Second)
+	for {
+		select {
+		case <-p.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			var msg message
+			msg.ID = p.id
+			msg.signature()
+			var buf []byte
+			var err error
+			buf, err = json.Marshal(msg)
+			if err == nil {
+				for _, conn := range p.conn {
+					_, _ = conn.WriteTo(buf, p.addr)
+				}
+			}
+			timer.Reset(30 * time.Second)
+		}
+	}
+}
+
+func newProbe(ctx context.Context, id string) (l *prober, err error) {
+	o := &prober{
+		id:     id,
+		ctx:    ctx,
+		result: make(chan Result, 10),
+		addr:   &net.UDPAddr{IP: multicastIP, Port: Port},
+	}
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	for _, ifi := range ifs {
+		var c *net.UDPConn
+		if ifi.Flags&net.FlagLoopback == net.FlagLoopback {
+			continue
+		}
+		c, err = net.ListenMulticastUDP("udp4", &ifi, o.addr)
+		if err != nil {
+			err = nil
+			continue
+		}
+		log.Printf("start prober @ %s", ifi.Name)
+		o.conn = append(o.conn, &connector{
+			UDPConn: c,
+			ifi:     ifi,
+		})
+	}
+	if err != nil {
+		return
+	}
+	o.g, o.ctx = errgroup.WithContext(o.ctx)
+	l = o
 	return
 }
 
 func Probe(ctx context.Context, id string) (resC <-chan Result, err error) {
-	l, err := newProber(ctx, id)
+	p, err := newProbe(ctx, id)
 	if err != nil {
 		return
 	}
-	l.probe()
-	resC = l.result
+	for _, conn := range p.conn {
+		func(c *connector) {
+			p.g.Go(func() error {
+				return p.readLoop(c)
+			})
+		}(conn)
+	}
+	go p.probeLoop()
+	resC = p.result
 	return
 }

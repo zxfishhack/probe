@@ -47,7 +47,7 @@ func main() {
 			}
 		}()
 		for res := range resC {
-			log.Printf("%#v", res)
+			log.Printf("ID: %s IP: %s", res.ID, res.IP)
 		}
 	}
 }
